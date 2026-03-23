@@ -108,6 +108,9 @@ export default class ReolinkVideoclipssMixin extends SettingsMixinDeviceBase<any
 
     async release() {
         this.killed = true;
+        if (this.plugin.mixinsMap[this.id] === this) {
+            delete this.plugin.mixinsMap[this.id];
+        }
     }
 
     async checkFtpScan() {
@@ -301,33 +304,98 @@ export default class ReolinkVideoclipssMixin extends SettingsMixinDeviceBase<any
     }
 
     async getClient() {
-        if (!this.client) {
-            const { channel, host, username: usernameParent, password: passwordParent } = await this.getDeviceProperties();
-            const { username, password } = this.storageSettings.values;
-
-            this.client = new ReolinkCameraClient(
-                host,
-                username || usernameParent,
-                password || passwordParent,
-                channel,
-                this.console,
-                true,
-            );
+        const cachedClient = this.plugin.clientMap.get(this.id);
+        if (cachedClient) {
+            this.client = cachedClient;
+            return cachedClient;
         }
 
-        return this.client;
+        let clientPromise = this.plugin.clientPromiseMap.get(this.id);
+
+        if (!clientPromise) {
+            clientPromise = (async () => {
+                const { channel, host, username: usernameParent, password: passwordParent } = await this.getDeviceProperties();
+                const { username, password } = this.storageSettings.values;
+
+                const client = new ReolinkCameraClient(
+                    host,
+                    username || usernameParent,
+                    password || passwordParent,
+                    channel,
+                    this.console,
+                    true,
+                );
+
+                this.plugin.clientMap.set(this.id, client);
+                this.client = client;
+
+                return client;
+            })();
+
+            this.plugin.clientPromiseMap.set(this.id, clientPromise);
+            clientPromise.finally(() => {
+                if (this.plugin.clientPromiseMap.get(this.id) === clientPromise) {
+                    this.plugin.clientPromiseMap.delete(this.id);
+                }
+            }).catch(() => { });
+        }
+
+        const client = await clientPromise;
+        this.client = client;
+        return client;
     }
 
-    async getVideoclipWebhookUrls(videoclipPath: string) {
-        const cloudEndpoint = await endpointManager.getCloudEndpoint(undefined, { public: true });
-        const [endpoint, parameters] = cloudEndpoint.split('?') ?? '';
+    private async getWebhookEndpointBase(preferRelative = true) {
+        const logger = this.getLogger();
+        const endpointApi = endpointManager as {
+            getPath?: (nativeId?: string, options?: { public?: boolean }) => Promise<string>;
+            getLocalEndpoint?: (nativeId?: string, options?: { public?: boolean; insecure?: boolean }) => Promise<string>;
+            getCloudEndpoint?: (nativeId?: string, options?: { public?: boolean }) => Promise<string>;
+        };
+        const resolvers: { label: string; resolveEndpoint: () => Promise<string | undefined> }[] = preferRelative ? [
+            { label: 'path', resolveEndpoint: () => endpointApi.getPath?.(undefined, { public: true }) },
+            { label: 'local endpoint', resolveEndpoint: () => endpointApi.getLocalEndpoint?.(undefined, { public: true }) },
+            { label: 'cloud endpoint', resolveEndpoint: () => endpointApi.getCloudEndpoint?.(undefined, { public: true }) },
+        ] : [
+            { label: 'local endpoint', resolveEndpoint: () => endpointApi.getLocalEndpoint?.(undefined, { public: true }) },
+            { label: 'cloud endpoint', resolveEndpoint: () => endpointApi.getCloudEndpoint?.(undefined, { public: true }) },
+            { label: 'path', resolveEndpoint: () => endpointApi.getPath?.(undefined, { public: true }) },
+        ];
+
+        let lastError: unknown;
+        for (const { label, resolveEndpoint } of resolvers) {
+            try {
+                const endpoint = await resolveEndpoint();
+                if (endpoint) {
+                    return endpoint;
+                }
+            } catch (e) {
+                lastError = e;
+                logger.debug(`Unable to resolve ${label} for videoclip webhooks`, e);
+            }
+        }
+
+        throw lastError ?? new Error('Unable to resolve an endpoint for videoclip webhooks.');
+    }
+
+    private buildWebhookUrl(endpointBase: string, webhook: 'videoclip' | 'thumbnail', params: { deviceId: string; videoclipPath: string }) {
+        const [rawEndpoint, query = ''] = endpointBase.split('?');
+        const endpoint = rawEndpoint.endsWith('/') ? rawEndpoint : `${rawEndpoint}/`;
+        const searchParams = new URLSearchParams(query);
+        searchParams.set('params', JSON.stringify(params));
+
+        return `${endpoint}${webhook}?${searchParams.toString()}`;
+    }
+
+    async getVideoclipWebhookUrls(videoclipPath: string, endpointBase?: string) {
+        const resolvedEndpointBase = endpointBase ?? await this.getWebhookEndpointBase();
         const params = {
             deviceId: this.id,
             videoclipPath,
         }
 
-        const videoclipUrl = `${endpoint}videoclip?params=${JSON.stringify(params)}&${parameters}`;
-        const thumbnailUrl = `${endpoint}thumbnail?params=${JSON.stringify(params)}&${parameters}`;
+        const videoclipUrl = this.buildWebhookUrl(resolvedEndpointBase, 'videoclip', params);
+        const thumbnailUrl = this.buildWebhookUrl(resolvedEndpointBase, 'thumbnail', params);
 
         return { videoclipUrl, thumbnailUrl };
     }
@@ -353,6 +421,7 @@ export default class ReolinkVideoclipssMixin extends SettingsMixinDeviceBase<any
             const videoclips: VideoClip[] = [];
 
             if (ftp) {
+                const endpointBase = await this.getWebhookEndpointBase();
                 for (const item of this.ftpScanData) {
                     const timestamp = this.processDate(item.time);
 
@@ -362,7 +431,7 @@ export default class ReolinkVideoclipssMixin extends SettingsMixinDeviceBase<any
                         const videoclipPath = item.fullPath;
 
                         const event = 'motion';
-                        const { thumbnailUrl, videoclipUrl } = await this.getVideoclipWebhookUrls(videoclipPath);
+                        const { thumbnailUrl, videoclipUrl } = await this.getVideoclipWebhookUrls(videoclipPath, endpointBase);
                         videoclips.push({
                             id: videoclipPath,
                             startTime: timestamp,
@@ -402,6 +471,7 @@ export default class ReolinkVideoclipssMixin extends SettingsMixinDeviceBase<any
                     token: api.parameters.token
                 }));
 
+                const endpointBase = await this.getWebhookEndpointBase();
                 for (const searchElement of allSearchedElements) {
                     const videoclipPath = searchElement.name;
                     try {
@@ -412,7 +482,7 @@ export default class ReolinkVideoclipssMixin extends SettingsMixinDeviceBase<any
                         const { detectionClasses } = parseVideoclipName(videoclipPath)
 
                         const event = 'motion';
-                        const { thumbnailUrl, videoclipUrl } = await this.getVideoclipWebhookUrls(videoclipPath);
+                        const { thumbnailUrl, videoclipUrl } = await this.getVideoclipWebhookUrls(videoclipPath, endpointBase);
                         videoclips.push({
                             id: videoclipPath,
                             startTime,
@@ -453,35 +523,58 @@ export default class ReolinkVideoclipssMixin extends SettingsMixinDeviceBase<any
             videoclipUrl = videoclipId;
         } else {
             const api = await this.getClient();
-            const { playbackPathWithHost } = await api.getVideoClipUrl(videoclipId, this.id);
-            videoclipUrl = playbackPathWithHost;
+            const { downloadPathWithHost } = await api.getVideoClipUrl(videoclipId, this.id);
+            videoclipUrl = downloadPathWithHost;
         }
 
         return { videoclipUrl, filename, thumbnailFolder };
     }
 
+    private async queueThumbnailTask<T>(task: () => Promise<T>): Promise<T> {
+        const previous = (this.plugin.thumbnailQueueMap.get(this.id) ?? Promise.resolve()).catch(() => { });
+        let release: () => void;
+        const currentQueue = new Promise<void>(resolve => {
+            release = resolve;
+        });
+        this.plugin.thumbnailQueueMap.set(this.id, currentQueue);
+
+        await previous;
+
+        try {
+            return await task();
+        } finally {
+            release();
+            if (this.plugin.thumbnailQueueMap.get(this.id) === currentQueue) {
+                this.plugin.thumbnailQueueMap.delete(this.id);
+            }
+        }
+    }
+
     async getVideoClip(videoId: string): Promise<MediaObject> {
         const logger = this.getLogger();
         logger.log('Fetching videoId ', videoId);
-        const { videoclipUrl } = await this.getVideoclipWebhookUrls(videoId);
-        const videoclipMo = await sdk.mediaManager.createMediaObject(videoclipUrl, 'video/mp4');
+        const endpointBase = await this.getWebhookEndpointBase(false);
+        const { videoclipUrl } = await this.getVideoclipWebhookUrls(videoId, endpointBase);
+        const videoclipMo = await sdk.mediaManager.createMediaObjectFromUrl(videoclipUrl);
 
         return videoclipMo;
     }
 
     async getVideoClipThumbnail(thumbnailId: string, options?: VideoClipThumbnailOptions): Promise<MediaObject> {
-        const logger = this.getLogger();
-        logger.log('Fetching thumbnailId ', thumbnailId);
-        const { filename, videoclipUrl, thumbnailFolder } = await this.getVideoclipParams(thumbnailId);
+        return this.queueThumbnailTask(async () => {
+            const logger = this.getLogger();
+            logger.log('Fetching thumbnailId ', thumbnailId);
+            const { filename, videoclipUrl, thumbnailFolder } = await this.getVideoclipParams(thumbnailId);
 
-        const { thumbnailMo } = await getThumbnailMediaObject({
-            filename,
-            thumbnailFolder,
-            videoclipUrl,
-            console: this.console,
-        })
+            const { thumbnailMo } = await getThumbnailMediaObject({
+                filename,
+                thumbnailFolder,
+                videoclipUrl,
+                console: this.console,
+            })
 
-        return thumbnailMo;
+            return thumbnailMo;
+        });
     }
 
     removeVideoClips(...videoClipIds: string[]): Promise<void> {

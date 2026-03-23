@@ -2,6 +2,7 @@ import sdk, { DeviceBase, HttpRequest, HttpRequestHandler, HttpResponse, MixinPr
 import { StorageSettings } from "@scrypted/sdk/storage-settings";
 import { cleanup } from "./utils";
 import ReolinkVideoclipssMixin from "./cameraMixin";
+import type { ReolinkCameraClient } from "./client";
 import http from 'http';
 import fs from 'fs';
 
@@ -19,6 +20,9 @@ export default class ReolinkVideoclipssProvider extends ScryptedDeviceBase imple
         },
     });
     public mixinsMap: Record<string, ReolinkVideoclipssMixin> = {};
+    public clientMap = new Map<string, ReolinkCameraClient>();
+    public clientPromiseMap = new Map<string, Promise<ReolinkCameraClient>>();
+    public thumbnailQueueMap = new Map<string, Promise<void>>();
 
     constructor(nativeId: string) {
         super(nativeId);
@@ -154,6 +158,12 @@ export default class ReolinkVideoclipssProvider extends ScryptedDeviceBase imple
                             deviceId,
                         })}`);
                         const thumbnailMo = await dev.getVideoClipThumbnail(videoclipPath);
+                        if (!thumbnailMo) {
+                            response.send('Thumbnail unavailable', {
+                                code: 404,
+                            });
+                            return;
+                        }
                         const jpeg = await sdk.mediaManager.convertMediaObjectToBuffer(thumbnailMo, 'image/jpeg');
                         response.send(jpeg, {
                             headers: {

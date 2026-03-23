@@ -299,6 +299,17 @@ export const splitDateRangeByDay = (start: number, end: number) => {
     let currentStart = new Date(start);
     const endTime = new Date(end);
 
+    // Midnight is commonly used as an exclusive upper bound in clip queries.
+    if (
+        endTime.getTime() > currentStart.getTime()
+        && endTime.getHours() === 0
+        && endTime.getMinutes() === 0
+        && endTime.getSeconds() === 0
+        && endTime.getMilliseconds() === 0
+    ) {
+        endTime.setMilliseconds(-1);
+    }
+
     while (currentStart <= endTime) {
         // Calculate the end of the current day
         const endOfDay = new Date(currentStart);

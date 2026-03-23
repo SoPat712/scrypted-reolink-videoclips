@@ -35,7 +35,7 @@ export class ReolinkCameraClient {
     credential: AuthFetchCredentialState;
     parameters: Record<string, string>;
     tokenLease: number;
-    loggingIn = false;
+    loginPromise?: Promise<void>;
     refreshTokenInterval: NodeJS.Timeout;
 
     constructor(
@@ -53,12 +53,13 @@ export class ReolinkCameraClient {
         this.parameters = {};
 
         this.refreshTokenInterval = setInterval(async () => this.refreshSession(), 1000 * 60 * 5);
-        this.refreshSession().catch(this.console.log);
     }
 
     async refreshSession() {
         try {
-            await this.logout();
+            if (this.parameters.token) {
+                await this.logout();
+            }
             await this.login();
         } catch (e) {
             this.console.log('Error in refreshSession', e);
@@ -96,9 +97,12 @@ export class ReolinkCameraClient {
     }
 
     async login() {
-        try {
-            if (!this.loggingIn) {
-                this.loggingIn = true;
+        if (this.tokenLease > Date.now()) {
+            return;
+        }
+
+        if (!this.loginPromise) {
+            this.loginPromise = (async () => {
                 if (this.tokenLease > Date.now()) {
                     return;
                 }
@@ -108,14 +112,15 @@ export class ReolinkCameraClient {
                 }
 
                 const { parameters, leaseTimeSeconds } = await getLoginParameters(this.host, this.username, this.password, this.forceToken);
-                this.parameters = parameters
+                this.parameters = parameters;
                 this.tokenLease = Date.now() + 1000 * leaseTimeSeconds;
-                this.loggingIn = false;
                 this.console.log(`New token: ${parameters.token}`);
-            }
-        } finally {
-            this.loggingIn = false;
+            })().finally(() => {
+                this.loginPromise = undefined;
+            });
         }
+
+        await this.loginPromise;
     }
 
     async requestWithLogin(options: HttpFetchOptions<Readable>, body?: Readable) {
@@ -175,14 +180,27 @@ export class ReolinkCameraClient {
             }
         ];
 
-        try {
-            const response = await this.requestWithLogin({
-                url,
-                responseType: 'json',
-                method: 'POST',
-            }, this.createReadable(body));
+        const searchRequest = async () => this.requestWithLogin({
+            url,
+            responseType: 'json',
+            method: 'POST',
+        }, this.createReadable(body));
 
-            const error = response.body?.[0]?.error;
+        try {
+            let response = await searchRequest();
+
+            let error = response.body?.[0]?.error;
+            if (error?.rspCode === -6) {
+                this.parameters = {};
+                this.tokenLease = undefined;
+                response = await searchRequest();
+                error = response.body?.[0]?.error;
+            }
+
+            if (error?.rspCode === -17) {
+                return [];
+            }
+
             if (error) {
                 this.console.log('Error fetching videoclips', error, JSON.stringify({ body, url }));
                 return [];
@@ -190,6 +208,9 @@ export class ReolinkCameraClient {
 
             return (response.body?.[0]?.value?.SearchResult?.File ?? []) as VideoSearchResult[];
         } catch (e) {
+            if (e?.message?.includes('statusCode 502')) {
+                return [];
+            }
             this.console.log('Error fetching videoclips', e);
             return [];
         }
